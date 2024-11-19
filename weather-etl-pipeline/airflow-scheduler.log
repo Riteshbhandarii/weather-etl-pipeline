@@ -1,0 +1,9 @@
+2024-11-08 15:33:17,598 INFO - Loaded executor: SequentialExecutor
+2024-11-08 15:33:17,753 INFO - Starting the scheduler
+2024-11-08 15:33:17,762 INFO - Processing each file at most -1 times
+2024-11-08 15:33:17,807 INFO - Launched DagFileProcessorManager with pid: 9369
+2024-11-08 15:33:17,825 INFO - Adopting or resetting orphaned tasks for active dag runs
+2024-11-08 15:33:17,823 INFO - Configured default timezone UTC
+2024-11-08 15:38:18,063 INFO - Adopting or resetting orphaned tasks for active dag runs
+2024-11-08 15:43:18,209 INFO - Adopting or resetting orphaned tasks for active dag runs
+2024-11-08 15:43:18,213 INFO - Marked 1 SchedulerJob instances as failed
