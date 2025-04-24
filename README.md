@@ -1,341 +1,152 @@
-import pandas as pd
-import numpy as np
-import sqlite3
-import os
-import zipfile
-from airflow import DAG
-from airflow.operators.python_operator import PythonOperator
-from datetime import datetime, timedelta
-from kaggle.api.kaggle_api_extended import KaggleApi
-from dateutil import parser
-import logging
+# Weather Data ETL Pipeline
 
-# Define default arguments
-default_args = {
-    'owner': 'Team_14',
-    'depends_on_past': False,
-    'start_date': datetime(2024, 11, 19),
-    'retries': 1,
-    'retry_delay': timedelta(minutes=1),
-}
+## Overview
+This project implements an ETL (Extract, Transform, Load) pipeline using Apache Airflow to process weather data from a Kaggle dataset. The pipeline extracts weather data, transforms it by cleaning and aggregating, validates the data for consistency, and loads it into a SQLite database for further analysis.
 
-# Define the DAG
-dag = DAG(
-    'final_project_dag',
-    default_args=default_args,
-    description='ETL pipeline for Weather Dataset with validation and trigger rules',
-    schedule_interval='@daily',
-    catchup=False
-)
+## Prerequisites
+- **Python**: Version 3.8 or higher
+- **Apache Airflow**: Version 2.0 or higher
+- **Kaggle API**: For downloading the dataset
+- **Required Python Libraries**:
+  - pandas
+  - numpy
+  - sqlite3
+  - kaggle
+  - python-dateutil
+- **Directory Structure**:
+  - `/home/artem-holovchak/airflow/datasets/`: For storing downloaded and extracted dataset files
+  - `/home/artem-holovchak/airflow/databases/`: For storing the SQLite database
+  - `/tmp/`: For temporary storage of transformed CSV files
 
-# File paths
-db_path = '/home/artem-holovchak/airflow/databases/final_project.db'
+## Installation
+1. **Set up Airflow**:
+   - Install Apache Airflow: `pip install apache-airflow`
+   - Initialize the Airflow database: `airflow db init`
+   - Start the Airflow scheduler and webserver:
+     ```bash
+     airflow scheduler &
+     airflow webserver -p 8080
+     ```
 
-# Task 1: Extract data
-def extract_data(**kwargs):
-    # Set up Kaggle API
-    api = KaggleApi()
-    api.authenticate()
+2. **Install Python dependencies**:
+   ```bash
+   pip install pandas numpy python-dateutil kaggle
+   ```
 
-    # Download the dataset file
-    api.dataset_download_file('muthuj7/weather-dataset', file_name='weatherHistory.csv', path='/home/artem-holovchak/airflow/datasets')
+3. **Configure Kaggle API**:
+   - Obtain your Kaggle API token from the Kaggle website.
+   - Place the `kaggle.json` file in `~/.kaggle/` or set up the Kaggle API credentials as environment variables.
 
-    # Define file paths
-    downloaded_file_path = '/home/artem-holovchak/airflow/datasets/weatherHistory.csv'
-    zip_file_path = downloaded_file_path + '.zip'
+4. **Set up directories**:
+   ```bash
+   mkdir -p /home/artem-holovchak/airflow/datasets
+   mkdir -p /home/artem-holovchak/airflow/databases
+   ```
 
-    # Check if the downloaded file is a ZIP file
-    if zipfile.is_zipfile(zip_file_path):
-        # If it's a ZIP file, unzip it
-        with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
-            zip_ref.extractall('/home/artem-holovchak/airflow/datasets')
-        # Update file path to extracted CSV
-        os.remove(zip_file_path) # Delete the ZIP file after extraction
-    else:
-        print("Downloaded file is not a ZIP archive, skipping extraction.")
+5. **Place the DAG file**:
+   - Copy the DAG script (`final_project_dag.py`) to your Airflow DAGs folder (e.g., `~/airflow/dags/`).
 
-    # Push the CSV file path to XCom for use in the next steps
-    kwargs['ti'].xcom_push(key='csv_file_path', value=downloaded_file_path)
+## Pipeline Description
+The pipeline consists of four main tasks, orchestrated using Airflow:
 
+1. **Extract Task**:
+   - Downloads the `weatherHistory.csv` file from the Kaggle dataset `muthuj7/weather-dataset`.
+   - Checks if the downloaded file is a ZIP archive and extracts it if necessary.
+   - Stores the CSV file path in XCom for the next task.
 
-extract_task = PythonOperator(
-    task_id='extract_task',
-    python_callable=extract_data,
-    provide_context=True,
-    dag=dag,
-)
+2. **Transform Task**:
+   - Reads the CSV file and performs data cleaning:
+     - Converts `Formatted Date` to a proper datetime format, removes timezone information, and extracts the month.
+     - Handles missing values in critical columns (e.g., Temperature, Humidity) by filling them with monthly means.
+     - Removes duplicate rows.
+   - Performs feature engineering:
+     - Calculates daily averages for weather metrics (e.g., temperature, humidity).
+     - Calculates monthly averages and the mode of `Precip Type`.
+     - Adds a `wind_strength` feature based on wind speed categories.
+   - Saves transformed daily and monthly data to temporary CSV files and pushes their paths to XCom.
 
-# Task 2: Transform data
-def transform_data(**kwargs):
-    # Retrieve file path from XCom
-    file_path = kwargs['ti'].xcom_pull(key='csv_file_path')
-    if not file_path:
-        raise ValueError("File path not found in XCom. Ensure that the extraction step has been completed successfully.")
-    
-    df = pd.read_csv(file_path)
+3. **Validate Task**:
+   - Validates the transformed data:
+     - Ensures no missing values in critical columns.
+     - Checks if values (e.g., temperature, humidity, wind speed) are within acceptable ranges.
+     - Detects outliers in daily temperature data based on predefined monthly ranges and saves them to a CSV file if found.
+   - Logs validation results (success or failure) and pushes validated file paths to XCom.
 
-    # -- Convert Formatted Date to a proper data format -- #
-    
-    # Drop rows with missing date
-    if df['Formatted Date'].isnull().any():
-        df.dropna(subset=['Formatted Date'], inplace=True)
-        df.reset_index(drop=True, inplace=True)  # reset indicies after dropna
-    # Convert datatype into a datetime object (because this are strings)
-    df['Formatted Date'] = df['Formatted Date'].apply(lambda x: parser.parse(x) if isinstance(x, str) else x)
-    # Convert into pandas datetime64 object and remove timezone information (because different timezones used)
-    df['Formatted Date'] = pd.to_datetime(df['Formatted Date'], errors='coerce').dt.tz_localize(None)
-    # Exctract the month and the date from the Formatted Date column
-    df['Month'] = df['Formatted Date'].dt.month
-    df['Formatted Date'] = df['Formatted Date'].dt.date
+4. **Load Task**:
+   - Loads the validated daily and monthly data into a SQLite database (`final_project.db`).
+   - Creates two tables: `daily_weather` and `monthly_weather`, with appropriate schemas.
+   - Replaces existing data in the tables with the new data.
 
+## DAG Configuration
+- **DAG ID**: `final_project_dag`
+- **Schedule**: Runs daily (`@daily`)
+- **Start Date**: November 19, 2024
+- **Catchup**: Disabled
+- **Retries**: 1 retry with a 1-minute delay
+- **Trigger Rules**:
+  - `validate_task` and `load_task` run only if all upstream tasks succeed (`all_success`).
 
-    # Handle missing values in critical columns
-    critical_columns = ['Temperature (C)', 'Humidity', 'Wind Speed (km/h)', 'Visibility (km)', 'Pressure (millibars)']
-    for column in critical_columns:
-        if df[column].isnull().any(): # only if missing values in column (more efficient)
-            monthly_means = df.groupby(df['Month'])[column].apply(lambda x: x.mean(skipna=True)) # calculate mean value for each month (skip null)
-
-            df[column] = df.apply(
-                lambda row: monthly_means[row['Month']] if pd.isnull(row[column]) else row[column], axis=1  # fill missing values for particular month
-            )
-
-    # Remove duplicate rows
-    df.drop_duplicates(keep='last', inplace=True)
-
-    # --- Feature Engineering --- #
-
-    # Calculate daily average for weather data
-    daily_averages = df.groupby('Formatted Date', as_index=False).agg({
-        'Temperature (C)': 'mean',
-        'Apparent Temperature (C)': 'mean',
-        'Humidity': 'mean',
-        'Wind Speed (km/h)': 'mean',
-        'Visibility (km)': 'mean',
-        'Pressure (millibars)': 'mean'
-    })
-
-    # Rename new columns
-    daily_averages.rename(columns={
-        'Formatted Date': 'formatted_date',
-        'Temperature (C)': 'avg_temperature_c',
-        'Apparent Temperature (C)': 'avg_apparent_temperature_c',
-        'Humidity': 'avg_humidity',
-        'Wind Speed (km/h)': 'avg_wind_speed_kmh',
-        'Visibility (km)': 'avg_visibility_km',
-        'Pressure (millibars)': 'avg_pressure_millibars'
-    }, inplace=True)
-
-    # Calculate monthly mode for Precip Type
-    grouped_by_month = df.groupby('Month')['Precip Type']
-    monthly_mode = grouped_by_month.agg(lambda x: x.mode()[0] if len(x.mode()) == 1 else np.nan).reset_index() # mode if one clear mode else nan
-    monthly_mode.rename(columns={'Precip Type': 'Mode'}, inplace=True)
-
-    # -- Add new feature 'wind_strength' -- #
-
-    # Convert Wind Speed from km/h to m/s
-    daily_averages['avg_wind_speed_ms'] = daily_averages['avg_wind_speed_kmh'] * 1000 / 3600
-
-    # Define bins and labels
-    bins = [0, 1.5, 3.3, 5.4, 7.9, 10.7, 13.8, 17.1, 20.7, 24.4, 28.4, 32.6, float('inf')]
-    labels = [
-        'Calm', 'Light Air', 'Light Breeze', 'Gentle Breeze', 'Moderate Breeze',
-        'Fresh Breeze', 'Strong Breeze', 'Near Gale', 'Gale', 'Strong Gale',
-        'Storm', 'Violent Storm'
-    ]
-
-    # Categorize wind strength
-    daily_averages['wind_strength'] = pd.cut(daily_averages['avg_wind_speed_ms'], bins=bins, labels=labels)
-
-    # Drop the temporary avg_wind_speed_ms
-    daily_averages.drop(columns=['avg_wind_speed_ms'], inplace=True)
-
-    # Calculate monthly averages 
-    monthly_averages = df.groupby('Month', as_index=False).agg({
-        'Temperature (C)': 'mean',
-        'Apparent Temperature (C)': 'mean',
-        'Humidity': 'mean',
-        'Visibility (km)': 'mean',
-        'Pressure (millibars)': 'mean'
-    })
-
-    # Rename new columns
-    monthly_averages.rename(columns={
-        'Temperature (C)': 'avg_temperature_c',
-        'Apparent Temperature (C)': 'avg_apparent_temperature_c',
-        'Humidity': 'avg_humidity',
-        'Visibility (km)': 'avg_visibility_km',
-        'Pressure (millibars)': 'avg_pressure_millibars'
-    }, inplace=True)
-
-    # Merge monthly mode for precip type into monthly averages
-    monthly_averages = monthly_averages.merge(monthly_mode, on='Month', how='left')
-    monthly_averages.rename(columns={'Mode': 'mode_precip_type'}, inplace=True)
-
-    # Rename the 'Month' column in monthly_averages
-    monthly_averages.rename(columns={
-        'Month': 'month'
-    }, inplace=True)
-
-    # Save transformed data to new csv files
-    daily_transformed_file_path = '/tmp/daily_data.csv'
-    daily_averages.to_csv(daily_transformed_file_path, index=False)
-    kwargs['ti'].xcom_push(key='daily_transformed_file_path', value=daily_transformed_file_path)
-
-    monthly_transformed_file_path = '/tmp/monthly_data.csv'
-    monthly_averages.to_csv(monthly_transformed_file_path, index=False)
-    kwargs['ti'].xcom_push(key='monthly_transformed_file_path', value=monthly_transformed_file_path)
-
-transform_task = PythonOperator(
-    task_id='transform_task',
-    python_callable=transform_data,
-    provide_context=True,
-    dag=dag,
-)
-
-# Task 3: Validate data
-def validate_data(**kwargs):
-    # Retrieve transformed file pathes from XCom
-    transformed_daily_file = kwargs['ti'].xcom_pull(key='daily_transformed_file_path')
-    transformed_monthly_file = kwargs['ti'].xcom_pull(key='monthly_transformed_file_path')
-    daily_averages = pd.read_csv(transformed_daily_file)
-    monthly_averages = pd.read_csv(transformed_monthly_file)
-
-    # Ensure no critical columns have missing values after transformation
-    daily_critical_columns = ['avg_temperature_c', 'avg_humidity', 'avg_wind_speed_kmh', 'avg_apparent_temperature_c', 'avg_visibility_km', 'avg_pressure_millibars']
-    if daily_averages[daily_critical_columns].isnull().any().any():
-        raise ValueError("Validation failed: Missing values in critical columns for daily data after transformation.")
-    
-    monthly_critical_columns = ['avg_temperature_c', 'avg_humidity', 'avg_visibility_km', 'avg_pressure_millibars']
-    if monthly_averages[monthly_critical_columns].isnull().any().any():
-        raise ValueError("Validation failed: Missing values in critical columns for monthly data after transformation.")
-
-    
-    # Check whether the values are in appropriate ranges
-    if (daily_averages['avg_temperature_c'] < -50).any() or (daily_averages['avg_temperature_c'] > 50).any():
-        raise ValueError("Validation failed: Temperature values out of range.")
-    if (monthly_averages['avg_temperature_c'] < -50).any() or (monthly_averages['avg_temperature_c'] > 50).any():
-        raise ValueError("Validation failed: Temperature values out of range.")
-    
-    if (daily_averages['avg_humidity'] < 0).any() or (daily_averages['avg_humidity'] > 1).any():
-        raise ValueError("Validation failed: Humidity values out of range.")
-    if (monthly_averages['avg_humidity'] < 0).any() or (monthly_averages['avg_humidity'] > 1).any():
-        raise ValueError("Validation failed: Humidity values out of range.")
-    
-    if (daily_averages['avg_wind_speed_kmh'] < 0).any():
-        raise ValueError("Validation failed: Wind Speed values out of range.")
-    
-
-    # Check for critical outliers
-    month_temperature_ranges = {   # define temperature ranges for each month
-        1: (-50, 20),
-        2: (-50, 20),
-        3: (-40, 25),
-        4: (-30, 30),
-        5: (-20, 35),
-        6: (-5, 35),
-        7: (-1, 40),
-        8: (0, 50),
-        9: (-10, 50),
-        10: (-20, 40),
-        11: (-40, 30),
-        12: (-50, 20)
-    }
-    
-    daily_averages['Month'] = pd.to_datetime(daily_averages['formatted_date']).dt.month
-
-    outliers = daily_averages[daily_averages.apply(lambda row: not(   # check for outliers
-        month_temperature_ranges[row['Month']][0] <= row['avg_temperature_c'] <= month_temperature_ranges[row['Month']][1]
-    ), axis=1)]
-
-    if not outliers.empty:   # if outliers detected
-        # Define file's path and name
-        folder_path = '/home/artem-holovchak/airflow/datasets/'  # folder where to save the outliers
-        date_str = datetime.now().strftime("%d_%m_%Y")  # today's date
-        outliers_file_name = f"outliers_daily_weather_{date_str}.csv"
-        outliers_file_path = folder_path + outliers_file_name
-
-        # Save outliers to a csv file
-        outliers.to_csv(outliers_file_path, index=False)
-
-        # Log a warning for Airflow UI
-        message = f"WARNING: Outliers detected! Saved to {outliers_file_path} ."
-        logging.warning(message)
-    
-    else:   # if no outliers detected
-        message = "INFO: No outliers detected."
-        logging.info(message)   # display the message in Airflow UI
-
-    
-    daily_averages.drop(columns=['Month'], inplace=True)   # drop the Month column since not needed anymore
-
-    # Pass the files to XCom for the next task
-    kwargs['ti'].xcom_push(key='validated_daily_data_path', value=transformed_daily_file)
-    kwargs['ti'].xcom_push(key='validated_monthly_data_path', value=transformed_monthly_file)
-
-validate_task = PythonOperator(
-    task_id='validate_task',
-    python_callable=validate_data,
-    provide_context=True,
-    trigger_rule='all_success',   # Only run validation task if previous tasks were completed successful
-    dag=dag,
-)
-
-# Task 4: Load data
-def load_data(**kwargs):
-    # Retrieve validated file pathes from XCom
-    validated_daily_data_file_path = kwargs['ti'].xcom_pull(key='validated_daily_data_path')
-    validated_monthly_data_file_path = kwargs['ti'].xcom_pull(key='validated_monthly_data_path')
-
-    daily_averages = pd.read_csv(validated_daily_data_file_path)
-    monthly_averages = pd.read_csv(validated_monthly_data_file_path)
-
-    # Load data into SQLite database
-    conn = sqlite3.connect(db_path)  # if db doesn't exist, it will be created
-    cursor = conn.cursor()   # create a cursor connected to our database
-
-    # Create tables if they do not exist
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS daily_weather (
-            "id" INTEGER PRIMARY KEY AUTOINCREMENT,
-            "formatted_date" TEXT,
-            "avg_temperature_c" FLOAT,
-            "avg_apparent_temperature_c" FLOAT,
-            "avg_humidity" FLOAT,
-            "avg_wind_speed_kmh" FLOAT,
-            "avg_visibility_km" FLOAT,
-            "avg_pressure_millibars" FLOAT,
-            "wind_strength" TEXT      
-        )
-    ''')
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS monthly_weather (
-            "id" INTEGER PRIMARY KEY AUTOINCREMENT,
-            "month" INTEGER,
-            "avg_temperature_c" FLOAT,
-            "avg_apparent_temperature_c" FLOAT,
-            "avg_humidity" FLOAT,
-            "avg_visibility_km" FLOAT,
-            "avg_pressure_millibars" FLOAT,
-            "mode_precip_type" TEXT      
-        )
-    ''')
-
-    # Insert data into the database
-    daily_averages.to_sql('daily_weather', conn, if_exists='replace', index=False)
-    monthly_averages.to_sql('monthly_weather', conn, if_exists='replace', index=False)
-    conn.commit()   # make sure all changes are saved 
-    # close the connection
-    conn.cursor()
-    conn.close()
-
-load_task = PythonOperator(
-    task_id='load_task',
-    python_callable=load_data,
-    provide_context=True,
-    trigger_rule='all_success',   # Only proceed to load task if validation was successful
-    dag=dag,
-)
-
-# Set task dependencies with trigger rules
+## Task Dependencies
+```plaintext
 extract_task >> transform_task >> validate_task >> load_task
+```
+
+## Database Schema
+### `daily_weather` Table
+| Column                     | Type  | Description                              |
+|----------------------------|-------|------------------------------------------|
+| id                         | INTEGER | Primary key (auto-incremented)          |
+| formatted_date             | TEXT  | Date of the weather data                |
+| avg_temperature_c          | FLOAT | Average temperature (°C)                |
+| avg_apparent_temperature_c | FLOAT | Average apparent temperature (°C)       |
+| avg_humidity               | FLOAT | Average humidity (0-1)                  |
+| avg_wind_speed_kmh         | FLOAT | Average wind speed (km/h)               |
+| avg_visibility_km          | FLOAT | Average visibility (km)                 |
+| avg_pressure_millibars     | FLOAT | Average pressure (millibars)            |
+| wind_strength              | TEXT  | Wind strength category (e.g., Calm, Gale) |
+
+### `monthly_weather` Table
+| Column                     | Type  | Description                              |
+|----------------------------|-------|------------------------------------------|
+| id                         | INTEGER | Primary key (auto-incremented)          |
+| month                      | INTEGER | Month number (1-12)                     |
+| avg_temperature_c          | FLOAT | Average temperature (°C)                |
+| avg_apparent_temperature_c | FLOAT | Average apparent temperature (°C)       |
+| avg_humidity               | FLOAT | Average humidity (0-1)                  |
+| avg_visibility_km          | FLOAT | Average visibility (km)                 |
+| avg_pressure_millibars     | FLOAT | Average pressure (millibars)            |
+| mode_precip_type           | TEXT  | Most common precipitation type          |
+
+## Usage
+1. **Run the DAG**:
+   - Access the Airflow UI (default: `http://localhost:8080`).
+   - Enable the `final_project_dag` and trigger it manually or wait for the scheduled run.
+   - Monitor task execution in the Airflow UI.
+
+2. **Check Outputs**:
+   - **Dataset**: Downloaded and extracted CSV in `/home/artem-holovchak/airflow/datasets/`.
+   - **Transformed Data**: Temporary CSV files in `/tmp/` (`daily_data.csv`, `monthly_data.csv`).
+   - **Outliers**: If detected, saved as `outliers_daily_weather_<date>.csv` in `/home/artem-holovchak/airflow/datasets/`.
+   - **Database**: SQLite database (`final_project.db`) in `/home/artem-holovchak/airflow/databases/`.
+
+3. **Query the Database**:
+   - Use SQLite to query the `daily_weather` and `monthly_weather` tables:
+     ```bash
+     sqlite3 /home/artem-holovchak/airflow/databases/final_project.db
+     SELECT * FROM daily_weather LIMIT 10;
+     SELECT * FROM monthly_weather;
+     ```
+
+## Troubleshooting
+- **Kaggle API Errors**: Ensure the Kaggle API token is correctly configured.
+- **File Path Issues**: Verify that the specified directories exist and are writable.
+- **Validation Failures**: Check the Airflow logs for details on missing values or out-of-range data.
+- **Database Errors**: Ensure the SQLite database path is accessible and not locked.
+
+## Notes
+- The pipeline assumes the Kaggle dataset (`muthuj7/weather-dataset`) is available and contains the expected columns.
+- Outlier detection uses predefined temperature ranges for each month, which can be adjusted in the `validate_data` function.
+- The pipeline overwrites existing data in the SQLite tables (`if_exists='replace'`).
+
+## License
+This project is licensed under the MIT License.
